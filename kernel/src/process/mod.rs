@@ -9,6 +9,7 @@ use core::sync::atomic::*;
 use log::*;
 
 pub mod context;
+mod file_handler;
 
 pub fn init() {
     // NOTE: max_time_slice <= 5 to ensure 'priority' test pass

@@ -1,13 +1,14 @@
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
 use log::*;
-use simple_filesystem::file::File;
+use simple_filesystem::{INode, file::File};
 use spin::Mutex;
 use ucore_process::Context;
 use xmas_elf::{ElfFile, header, program::{Flags, ProgramHeader, SegmentData, Type}};
 
 use crate::arch::interrupt::{Context as ArchContext, TrapFrame};
 use crate::memory::{ByFrame, Delay, FrameAllocator, GlobalFrameAlloc, KernelStack, MemoryArea, MemoryAttr, MemorySet};
+use super::file_handler::FileHandler;
 
 // TODO: avoid pub
 pub struct Process {
@@ -50,11 +51,15 @@ impl Process {
     }
 
     /// Make a new user thread from ELF data
-    pub fn new_user<'a, Iter>(data: &[u8], args: Iter) -> Box<Process>
+    pub fn new_user<'a, Iter>(inode: &Arc<INode>, args: Iter) -> Box<Process>
         where Iter: Iterator<Item=&'a str>
     {
+        // Read data
+        use crate::fs::INodeExt;
+        let data: Vec<u8> = inode.read_as_vec().unwrap();
+
         // Parse elf
-        let elf = ElfFile::new(data).expect("failed to read elf");
+        let elf = ElfFile::new(data.as_slice()).expect("failed to read elf");
         let is32 = match elf.header.pt2 {
             header::HeaderPt2::Header32(_) => true,
             header::HeaderPt2::Header64(_) => false,
@@ -70,7 +75,7 @@ impl Process {
         }
 
         // Make page table
-        let (mut memory_set, entry_addr) = memory_set_from(&elf);
+        let (mut memory_set, entry_addr) = memory_set_from(&elf, &inode);
 
         // User stack
         use crate::consts::{USER_STACK_OFFSET, USER_STACK_SIZE, USER32_STACK_OFFSET};
@@ -165,10 +170,10 @@ unsafe fn push_args_at_stack<'a, Iter>(args: Iter, stack_top: usize) -> usize
 
 /// Generate a MemorySet according to the ELF file.
 /// Also return the real entry point address.
-fn memory_set_from(elf: &ElfFile<'_>) -> (MemorySet, usize) {
+fn memory_set_from(elf: &ElfFile<'_>, inode: &Arc<INode>) -> (MemorySet, usize) {
     debug!("come in to memory_set_from");
     let mut ms = MemorySet::new();
-    let mut entry = None;
+    let mut entry = elf.header.pt2.entry_point() as usize;
     for ph in elf.program_iter() {
         if ph.get_type() != Ok(Type::Load) {
             continue;
@@ -181,30 +186,33 @@ fn memory_set_from(elf: &ElfFile<'_>) -> (MemorySet, usize) {
         #[cfg(target_arch = "aarch64")]
         assert_eq!((virt_addr >> 48), 0xffff, "Segment Fault");
 
-        // Get target slice
         #[cfg(feature = "no_mmu")]
-        let target = ms.push(mem_size);
-        #[cfg(not(feature = "no_mmu"))]
-        let target = {
-            ms.push(virt_addr, virt_addr + mem_size, ByFrame::new(memory_attr_from(ph.flags()), GlobalFrameAlloc), "");
-            unsafe { ::core::slice::from_raw_parts_mut(virt_addr as *mut u8, mem_size) }
-        };
-        // Copy data
-        unsafe {
-            ms.with(|| {
-                if file_size != 0 {
-                    target[..file_size].copy_from_slice(&elf.input[offset..offset + file_size]);
-                }
-                target[file_size..].iter_mut().for_each(|x| *x = 0);
-            });
+        {
+            let target = ms.push(mem_size);
+            // Copy data
+            if file_size != 0 {
+                target[..file_size].copy_from_slice(&elf.input[offset..offset + file_size]);
+            }
+            target[file_size..].iter_mut().for_each(|x| *x = 0);
+            // Find real entry point
+            if ph.flags().is_execute() {
+                entry = entry - virt_addr + target.as_ptr() as usize;
+            }
         }
-        // Find real entry point
-        if ph.flags().is_execute() {
-            let origin_entry = elf.header.pt2.entry_point() as usize;
-            entry = Some(origin_entry - virt_addr + target.as_ptr() as usize);
+        #[cfg(not(feature = "no_mmu"))]
+        {
+            let handler = FileHandler {
+                inode: inode.clone(),
+                mem_start: virt_addr,
+                file_start: offset,
+                file_end: offset + file_size,
+                flags: memory_attr_from(ph.flags()),
+                allocator: GlobalFrameAlloc,
+            };
+            ms.push(virt_addr, virt_addr + mem_size, handler, "");
         }
     }
-    (ms, entry.unwrap())
+    (ms, entry)
 }
 
 fn memory_attr_from(elf_flags: Flags) -> MemoryAttr {

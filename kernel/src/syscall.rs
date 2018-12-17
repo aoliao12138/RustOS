@@ -201,14 +201,10 @@ fn sys_exec(name: *const u8, argc: usize, argv: *const *const u8, tf: &mut TrapF
     // Read program file
     let path = args[0].as_str();
     let inode = crate::fs::ROOT_INODE.lookup(path)?;
-    let size = inode.info()?.size;
-    let mut buf = Vec::with_capacity(size);
-    unsafe { buf.set_len(size); }
-    inode.read_at(0, buf.as_mut_slice())?;
 
     // Make new Context
     let iter = args.iter().map(|s| s.as_str());
-    let mut context = Process::new_user(buf.as_slice(), iter);
+    let mut context = Process::new_user(&inode, iter);
 
     // Activate new page table
     unsafe { context.memory_set.activate(); }
